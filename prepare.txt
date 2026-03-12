@@ -1,0 +1,338 @@
+#!/bin/bash
+
+# --- CONFIGURATION DATA ---
+# Maps OS_ENV to "IP HOSTNAME FQDN"
+declare -A HOSTS_DATA
+HOSTS_DATA["OEL9_PROD"]="10.5.80.138 oel9prodrepo oel9prodrepo.bracbank.com"
+HOSTS_DATA["RHEL9_PROD"]="10.5.80.134 rhel9prodrepo rhel9prodrepo.bracbank.com"
+HOSTS_DATA["OEL8_PROD"]="10.5.80.133 oel8prodrepo oel8prodrepo.bracbank.com"
+HOSTS_DATA["RHEL8_PROD"]="10.5.80.132 rhel8prodrepo rhel8prodrepo.bracbank.com"
+HOSTS_DATA["RHEL9_TEST"]="172.26.9.53 rhel9testrepo rhel9testrepo.bracbank.com"
+HOSTS_DATA["RHEL8_TEST"]="172.26.9.52 rhel8testrepo rhel8testrepo.bracbank.com"
+HOSTS_DATA["OEL9_TEST"]="172.26.9.55 oel9testrepo oel9testrepo.bracbank.com"
+HOSTS_DATA["OEL8_TEST"]="172.26.9.54 oel8testrepo oel8testrepo.bracbank.com"
+
+# --- HELPER: DETECT OS & ENVIRONMENT ---
+get_os_env() {
+    # Detect OS (OEL8, RHEL9, etc)
+    OS_TYPE=$(hostnamectl | grep "Operating System" | awk -F: '{print $2}' | awk '{type=($1=="Oracle"?"OEL":"RHEL"); match($0,/[0-9]/); print type substr($0,RSTART,1)}')
+    
+    # Identify Env (10.x = PROD, 172.x = TEST)
+    MAIN_IP=$(hostname -I | awk '{print $1}')
+    if [[ $MAIN_IP =~ ^10\. ]]; then
+        ENV="PROD"
+    elif [[ $MAIN_IP =~ ^172\. ]]; then
+        ENV="TEST"
+    else
+        ENV="UNKNOWN"
+    fi
+    
+    KEY="${OS_TYPE}_${ENV}"
+    REPO_INFO="${HOSTS_DATA[$KEY]}"
+    
+    if [ -z "$REPO_INFO" ]; then
+        echo "Error: No mapping found for $KEY"
+        exit 1
+    fi
+    
+    REPO_IP=$(echo $REPO_INFO | awk '{print $1}')
+    REPO_HOST=$(echo $REPO_INFO | awk '{print $2}')
+    REPO_FQDN=$(echo $REPO_INFO | awk '{print $3}')
+}
+
+# --- FUNCTION: CHECK CONNECTION ---
+check_connection() {
+    get_os_env
+    PORT=443
+    echo "Checking connection to $REPO_HOST ($REPO_IP) on port $PORT..."
+    
+    if command -v nc >/dev/null; then
+        nc -zv -w3 "$REPO_IP" "$PORT" >/dev/null 2>&1
+    else
+        (echo "quit"; sleep 1) | telnet "$REPO_IP" "$PORT" 2>&1 | grep -q "Connected"
+    fi
+
+    if [ $? -eq 0 ]; then
+        echo "Connected | Local Repo | $REPO_IP:$PORT"
+        return 0
+    else
+        echo "Could not Connect to Local Repo ($REPO_IP). Please ask network team for access."
+        return 1
+    fi
+}
+
+# --- FUNCTION: CHECK/ADD HOST ENTRY ---
+check_hostentry() {
+    get_os_env
+    # Check if IP exists (even if commented)
+    if grep -q "$REPO_IP" /etc/hosts; then
+        if grep -q "^#.*$REPO_IP" /etc/hosts; then
+            echo "Uncommenting existing entry for $REPO_IP..."
+            sed -i "/$REPO_IP/s/^#//" /etc/hosts
+        else
+            echo "Host entry for $REPO_IP is already active."
+        fi
+    else
+        echo "Adding host entry: $REPO_IP $REPO_HOST $REPO_FQDN"
+        echo -e "$REPO_IP\t$REPO_HOST\t$REPO_FQDN" >> /etc/hosts
+    fi
+}
+
+# --- FUNCTION: PREPARE (FULL CYCLE) ---
+prepare() {
+    echo "--- Starting Preparation for $KEY ---"
+    
+    if ! check_connection; then exit 1; fi
+    check_hostentry
+    
+    echo "Backing up old repo files..."
+    mkdir -p /etc/yum.repos.d/backup
+    mv /etc/yum.repos.d/*.repo /etc/yum.repos.d/backup/ 2>/dev/null
+	
+	# --- DISABLE PLUGINS ---
+    echo "Disabling Management Plugins..."
+    
+    # OEL Specific: Spacewalk and RHN Plugin
+    if [[ "$OS_TYPE" == *"OEL"* ]]; then
+        echo "Detected OEL: Disabling Spacewalk/ULN plugins..."
+        [ -f /etc/yum/pluginconf.d/spacewalk.conf ] && sed -i 's/enabled = 1/enabled = 0/' /etc/yum/pluginconf.d/spacewalk.conf
+        #[ -f /etc/yum/pluginconf.d/rhnplugin.conf ] && sed -i 's/enabled = 1/enabled = 0/' /etc/yum/pluginconf.d/rhnplugin.conf
+    fi
+	
+    
+    echo "Creating new local.repo for $KEY..."
+    case "$KEY" in
+        "RHEL9_PROD")
+            cat <<EOF > /etc/yum.repos.d/local.repo
+[rhel9-baseos]
+name=RHEL 9 BaseOS Local Repo
+baseurl=https://rhel9prodrepo.bracbank.com
+enabled=1
+gpgcheck=0
+
+[rhel9-appstream]
+name=RHEL 9 AppStream Local Repo
+baseurl=https://rhel9prodrepo.bracbank.com
+enabled=1
+gpgcheck=0
+EOF
+            ;;
+        "RHEL9_TEST")
+            cat <<EOF > /etc/yum.repos.d/local.repo
+[rhel9-baseos]
+name=RHEL 9 BaseOS Local Repo
+baseurl=https://rhel9testrepo.bracbank.com/BaseOS/rhel-9-for-x86_64-baseos-rpms/
+enabled=1
+gpgcheck=0
+
+[rhel9-appstream]
+name=RHEL 9 AppStream Local Repo
+baseurl=https://rhel9testrepo.bracbank.com/AppStream/rhel-9-for-x86_64-appstream-rpms/
+enabled=1
+gpgcheck=0
+EOF
+            ;;
+        "RHEL8_PROD")
+            cat <<EOF > /etc/yum.repos.d/local.repo
+[baseos]
+name=RHEL8 BaseOS Repo
+baseurl=https://rhel8prodrepo.bracbank.com/BaseOS/rhel-8-for-x86_64-baseos-rpms/
+enabled=1
+gpgcheck=0
+sslverify=0
+
+[appstream]
+name=RHEL8 AppStream Repo
+baseurl=https://rhel8prodrepo.bracbank.com/AppStream/rhel-8-for-x86_64-appstream-rpms/
+enabled=1
+gpgcheck=0
+sslverify=0
+
+
+[CodeReady]
+name=RHEL8 CodeReady Repo
+baseurl=https://rhel8prodrepo.bracbank.com/CodeReady/codeready-builder-for-rhel-8-x86_64-rpms/
+enabled=1
+gpgcheck=0
+sslverify=0
+
+[docker-ce]
+name=RHEL8 Docker Repo
+baseurl=https://rhel8prodrepo.bracbank.com/docker-ce/docker-ce-stable/
+enabled=0
+gpgcheck=0
+sslverify=0
+
+[Nginx]
+name=RHEL8 Nginx Repo
+baseurl=https://rhel8prodrepo.bracbank.com/nginx/nginx-stable/
+enabled=0
+gpgcheck=0
+sslverify=0
+
+[epel]
+name=RHEL8 Epel Repo
+baseurl=https://rhel8prodrepo.bracbank.com/epel/epel/
+enabled=1
+gpgcheck=0
+sslverify=0
+
+
+[Remi]
+name=RHEL8 Remi Repo
+baseurl=https://rhel8prodrepo.bracbank.com/remi/remi/
+enabled=1
+gpgcheck=0
+sslverify=0
+
+[Remi-Modular]
+name=RHEL8 Remi-Modular Repo
+baseurl=https://rhel8prodrepo.bracbank.com/remi-modular/remi-modular/
+enabled=0
+gpgcheck=0
+sslverify=0
+EOF
+            ;;
+        "RHEL8_TEST")
+            cat <<EOF > /etc/yum.repos.d/local.repo
+[BaseOS]
+name=rhel-8-for-x86_64-baseos-rpms
+baseurl=https://rhel8testrepo.bracbank.com/BaseOS/rhel-8-for-x86_64-baseos-rpms/
+gpgcheck=0
+enabled=1
+priority=1
+sslverify=false
+
+[AppStream]
+name=rhel-8-for-x86_64-appstream-rpms
+baseurl=https://rhel8testrepo.bracbank.com/AppStream/rhel-8-for-x86_64-appstream-rpms/
+gpgcheck=0
+enabled=1
+priority=1
+sslverify=false
+
+[CodeReady]
+name=CodeReady
+baseurl=https://rhel8testrepo.bracbank.com/CodeReady/codeready-builder-for-rhel-8-x86_64-rpms/
+gpgcheck=0
+enabled=0
+priority=1
+sslverify=false
+
+[epel]
+name=epel
+baseurl=https://rhel8testrepo.bracbank.com/epel/epel/
+gpgcheck=0
+enabled=1
+priority=1
+sslverify=false
+
+[docker]
+name=docker
+baseurl=https://rhel8testrepo.bracbank.com/docker/
+gpgcheck=0
+enabled=0
+priority=1
+sslverify=false
+
+[nginx]
+name=nginx
+baseurl=https://rhel8testrepo.bracbank.com/nginx/nginx-stable/
+gpgcheck=0
+enabled=0
+priority=1
+sslverify=false
+
+[remi]
+name=remi
+baseurl=https://rhel8testrepo.bracbank.com/remi/remi/
+gpgcheck=0
+enabled=1
+priority=1
+sslverify=false
+
+[remi-modular]
+name=remi-modular
+baseurl=https://rhel8testrepo.bracbank.com/remi-modular/remi-modular/
+gpgcheck=0
+enabled=0
+priority=1
+sslverify=false
+
+[remi-safe]
+name=remi-safe
+baseurl=https://rhel8testrepo.bracbank.com/remi-safe/remi-safe/
+gpgcheck=0
+enabled=0
+priority=1
+sslverify=false
+EOF
+            ;;
+        "OEL9_PROD")
+            cat <<EOF > /etc/yum.repos.d/local.repo
+# PASTE OEL9 PROD CONTENT HERE
+EOF
+            ;;
+        "OEL9_TEST")
+            cat <<EOF > /etc/yum.repos.d/local.repo
+# PASTE OEL9 TEST CONTENT HERE
+EOF
+            ;;
+        "OEL8_PROD")
+            cat <<EOF > /etc/yum.repos.d/local.repo
+[oel8-baseos]
+name=OEL8 BaseOS Repo
+baseurl=https://oel8prodrepo.bracbank.com/baseos/
+enabled=1
+gpgcheck=0
+sslverify=0
+
+[oel8-appstream]
+name=OEL8 AppStream Repo
+baseurl= https://oel8prodrepo.bracbank.com/appstream/
+enabled=1
+gpgcheck=0
+sslverify=0
+EOF
+            ;;
+        "OEL8_TEST")
+            cat <<EOF > /etc/yum.repos.d/local.repo
+[ol8_baseos_local]
+name=BaseOS
+baseurl=https://oel8testrepo.bracbank.com/baseos/ 
+gpgcheck=0
+enabled=1
+
+[ol8_appstream_local]
+name=AppStream
+baseurl=https://oel8testrepo.bracbank.com/appstream/
+gpgcheck=0
+enabled=1
+
+
+[ol8_docker-ce]
+name=Docker-ce
+baseurl=https://oel8testrepo.bracbank.com/docker-ce/
+gpgcheck=0
+enabled=0
+
+[ol8_epel]
+name=epel
+baseurl=https://oel8testrepo.bracbank.com/epel/
+gpgcheck=0
+enabled=1
+EOF
+            ;;
+        *)
+            echo "Error: Key $KEY not recognized."
+            exit 1
+            ;;
+    esac
+
+    echo "Running yum clean & makecache..."
+    yum clean all && yum makecache
+    echo "--- Preparation Complete ---"
+}
+
+# Execute function passed as argument
+"$@"
